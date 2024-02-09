@@ -1,0 +1,759 @@
+const SECTOR_SIZE: usize = 512; // Only used in the beginning stages of FAT loading when we don't know the size of each sector
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct FSInfo {
+    lead_sig: u32, // Should be 0x41615252
+    reserved_1: [u8; 480],
+    second_sig: u32,                     // Should be 0x61417272
+    last_known_free_cluster_count: u32,  // if 0xFFFFFFFF must be computed
+    available_clusters_start_index: u32, // if 0xFFFFFFFF start cluster when looking for avaliable clusters
+    reserved_2: [u8; 12],
+    trail_sig: u32, // Should be 0xAA550000
+}
+
+#[repr(packed)]
+#[derive(Clone, Copy)]
+pub struct DirectoryAttributes(u8);
+impl DirectoryAttributes {
+    const READ_ONLY: u8 = 0x01;
+    const HIDDEN: u8 = 0x02;
+    const SYSTEM: u8 = 0x04;
+    const VOLUME_ID: u8 = 0x08;
+    const DIRECTORY: u8 = 0x10;
+    const ARCHIVE: u8 = 0x20;
+    const LONG_FILE_NAME: u8 = Self::READ_ONLY | Self::HIDDEN | Self::SYSTEM | Self::VOLUME_ID;
+
+    fn is_read_only(&self) -> bool {
+        self.0 | Self::READ_ONLY != 0x0
+    }
+
+    fn is_hidden(&self) -> bool {
+        self.0 | Self::HIDDEN != 0x0
+    }
+
+    fn is_system(&self) -> bool {
+        self.0 | Self::SYSTEM != 0x0
+    }
+
+    fn is_volume_id(&self) -> bool {
+        self.0 | Self::VOLUME_ID != 0x0
+    }
+
+    fn is_directory(&self) -> bool {
+        self.0 | Self::DIRECTORY != 0x0
+    }
+
+    fn is_file(&self) -> bool {
+        self.0 | Self::DIRECTORY == 0x0
+    }
+
+    fn is_archive(&self) -> bool {
+        self.0 | Self::ARCHIVE != 0x0
+    }
+
+    fn has_long_file_name(&self) -> bool {
+        self.0 | Self::LONG_FILE_NAME == Self::LONG_FILE_NAME
+    }
+}
+impl TryFrom<u8> for DirectoryAttributes {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value % 2 == 0 {
+            Ok(DirectoryAttributes(value))
+        } else {
+            Err(())
+        }
+    }
+}
+
+#[repr(packed)]
+#[derive(Clone, Copy)]
+pub struct U16time(u16);
+impl U16time {}
+
+#[repr(packed)]
+#[derive(Clone, Copy)]
+pub struct U16date(u16);
+impl U16date {}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct DirectoryEntry {
+    file_name: [u8; 8],
+    extension: [u8; 3],
+    attributes: DirectoryAttributes,
+    reserved: u8,
+
+    creation_time_hundreth_of_second: u8,
+    creation_time: U16time,
+    creation_date: U16date,
+    last_access_date: U16date,
+
+    high_bits_of_cluster_number: u16,
+
+    last_modification_time: U16time,
+    last_modification_date: U16date,
+
+    low_bits_of_cluster_number: u16,
+    size_of_file: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct LongFileNameEntry {
+    idk: u8,
+    first: [u16; 5],
+    attribute: DirectoryAttributes, // Always equal to DirectoryAttributes::LONG_FILE_NAME
+    entry_type: u8,
+    checksum_of_short_filename: u8,
+    next: [u16; 6],
+    zero: u16,
+    last: [u16; 2],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct FAT32VolumeHeader {
+    jump_instructions: [u8; 3],
+    oem_identifier: [u8; 8],
+
+    bytes_per_sector: u16,
+    sectors_per_cluster: u8,
+    reserved_sectors: u16,
+    fat_count: u8,
+    root_directory_count: u16,
+    total_sectors: u16,
+    media_descriptor: u8,
+    sectors_per_fat: u16, // Sectors per fat (For Fat16)
+
+    sectors_per_track: u16,
+    number_of_heads: u16,
+    beginning_sector: u32, // Hidden Sectors
+    large_total_sectors: u32,
+
+    large_sectors_per_fat: u32,
+    mirroring_flags: u16,
+    version: u16,
+    root_directory_cluster: u32,
+    location_of_fs_info_sector: u16,
+    location_of_backup_sector: u16,
+    boot_file_name: [u8; 12],
+    physical_drive_number: u8,
+    extra_flags: u8,
+    extended_boot_sig: u8,
+    volume_serial_number: u32,
+    volume_label: [u8; 11],
+    system_identifier_str: [u8; 8],
+    padding: [u8; 420],
+    bootable_partition_sig: u16,
+}
+
+pub struct Fat32Disk {
+    volume_header: FAT32VolumeHeader,
+    fs_info: FSInfo,
+    fat: Vec<u32>,
+    disk: Disk,
+}
+
+// Setup
+impl Fat32Disk {
+    fn read_fat32_volume_header(disk: &mut Disk) -> FAT32VolumeHeader {
+        let mut bytes: [u8; SECTOR_SIZE] = [0_u8; SECTOR_SIZE];
+        disk.read_sectors_from_disk(0, 1, SECTOR_SIZE, &mut bytes);
+        unsafe { mem::transmute(bytes) }
+    }
+
+    fn read_fs_info(disk: &mut Disk, volume_header: &FAT32VolumeHeader) -> FSInfo {
+        let mut bytes = [0_u8; std::mem::size_of::<FSInfo>()];
+        disk.read_sectors_from_disk(
+            volume_header.beginning_sector + volume_header.location_of_fs_info_sector as u32,
+            1,
+            volume_header.bytes_per_sector as usize,
+            &mut bytes,
+        );
+        unsafe { mem::transmute(bytes) }
+    }
+
+    fn read_fat(disk: &mut Disk, volume_header: &FAT32VolumeHeader) -> Vec<u32> {
+        let fat_begin_lba = volume_header.beginning_sector + volume_header.reserved_sectors as u32;
+        let fat_sector_count = volume_header.fat_count as u32 * volume_header.large_sectors_per_fat;
+
+        let mut buffer =
+            vec![0_u8; fat_sector_count as usize * volume_header.bytes_per_sector as usize];
+        disk.read_sectors_from_disk(
+            fat_begin_lba,
+            fat_sector_count,
+            volume_header.bytes_per_sector as usize,
+            &mut buffer,
+        );
+
+        let fat_size = volume_header.large_sectors_per_fat as usize
+            * volume_header.bytes_per_sector as usize
+            / 4;
+
+        let mut fats: Vec<u32> = vec![0_u32; fat_size];
+        for (i, buffer_chunk) in buffer.chunks_exact(4).enumerate() {
+            let fat_index = i / fat_size;
+            let index = i % fat_size;
+
+            let cluster = u32::from_le_bytes(buffer_chunk.try_into().unwrap());
+            if fat_index > 0 {
+                fats[index] = cluster;
+            } else if fats[index] != cluster {
+                // What should we do? Probably just ignore it ig
+                // panic!("Invalid fat chunk found!");
+            }
+        }
+
+        fats
+    }
+
+    fn read_directory_entry_from_buffer(offset: usize, buffer: &[u8]) -> DirectoryEntry {
+        let directory_buffer: &[u8; 32] = buffer
+            .get((mem::size_of::<DirectoryEntry>() * offset)..)
+            .and_then(|s| s.get(..mem::size_of::<DirectoryEntry>()))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        unsafe { std::mem::transmute(*directory_buffer) }
+    }
+
+    fn read_long_file_name_entry_from_buffer(offset: u16, buffer: &[u8]) -> LongFileNameEntry {
+        let directory_buffer: &[u8; 32] = buffer
+            .get((mem::size_of::<LongFileNameEntry>() * offset as usize)..)
+            .and_then(|s| s.get(..mem::size_of::<LongFileNameEntry>()))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        unsafe { std::mem::transmute(*directory_buffer) }
+    }
+}
+
+impl Fat32Disk {
+    fn update_fs_info(&mut self) {
+        let mut free_cluster_count = 0_usize;
+        let mut first_cluster_index = 0_usize;
+
+        for (i, fat_cluster) in self.fat.iter().enumerate() {
+            if *fat_cluster == 0 {
+                if first_cluster_index == 0 {
+                    first_cluster_index = i;
+                }
+                free_cluster_count += 1;
+            }
+        }
+
+        self.fs_info.available_clusters_start_index = first_cluster_index as u32;
+        self.fs_info.last_known_free_cluster_count = free_cluster_count as u32;
+    }
+
+    fn write_fat_volume_header(&mut self) {
+        let bytes: &[u8; mem::size_of::<FAT32VolumeHeader>()] =
+            &unsafe { mem::transmute(self.volume_header) };
+
+        self.disk.write_sectors_to_disk(
+            self.volume_header.beginning_sector,
+            (mem::size_of::<FAT32VolumeHeader>() as u32
+                / self.volume_header.bytes_per_sector as u32)
+                .min(1),
+            self.volume_header.bytes_per_sector as usize,
+            bytes,
+        );
+    }
+
+    fn write_fs_info(&mut self) {
+        let bytes: &[u8; mem::size_of::<FSInfo>()] = &unsafe { mem::transmute(self.fs_info) };
+
+        let cluster_begin_lba = self.volume_header.beginning_sector
+            + self.volume_header.reserved_sectors as u32
+            + (self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat);
+
+        self.disk.write_sectors_to_disk(
+            cluster_begin_lba + self.volume_header.location_of_fs_info_sector as u32,
+            (mem::size_of::<FSInfo>() as u32 / self.volume_header.bytes_per_sector as u32).min(1),
+            self.volume_header.bytes_per_sector as usize,
+            bytes,
+        );
+    }
+
+    fn write_fat(&mut self) {
+        let fat_begin_lba =
+            self.volume_header.beginning_sector + self.volume_header.reserved_sectors as u32;
+        let fat_sector_count =
+            self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat;
+
+        let mut bytes = vec![0_u8; self.fat.len() * std::mem::size_of::<u32>()];
+        for (i, fat_cluster_num) in self.fat.iter().enumerate() {
+            let bytes_slice =
+                &mut bytes[i * std::mem::size_of::<u32>()..][..std::mem::size_of::<u32>()];
+            bytes_slice.copy_from_slice(&fat_cluster_num.to_le_bytes());
+        }
+
+        if self.volume_header.fat_count > 1 {
+            let bytes_clone = bytes.clone();
+            for _ in 1..self.volume_header.fat_count {
+                bytes.extend(bytes_clone.iter());
+            }
+        }
+
+        // Pad to sector size (Should I do this?)
+        // let byte_padding_size = volume_header.bytes_per_sector as usize
+        //     - (bytes.len() % volume_header.bytes_per_sector as usize) as usize;
+        // bytes.extend(vec![0_u8; byte_padding_size]);
+
+        self.disk.write_sectors_to_disk(
+            fat_begin_lba,
+            fat_sector_count,
+            self.volume_header.bytes_per_sector as usize,
+            &bytes,
+        );
+    }
+
+    fn deallocate_cluster(
+        &mut self,
+        cluster: u32,
+        previous_cluster: Option<u32>,
+        search_for_previous_cluster: bool,
+    ) {
+        self.fat[cluster as usize] = 0;
+
+        match previous_cluster {
+            Some(prev_cluster) => {
+                self.fat[prev_cluster as usize] = 0xFFFFFFFF;
+            }
+            None => if search_for_previous_cluster {},
+        }
+        self.fs_info.last_known_free_cluster_count -= 1;
+    }
+
+    fn allocate_blank_cluster(&mut self) -> Option<u32> {
+        if self.fs_info.last_known_free_cluster_count == 0xFFFFFFFF {
+            return None;
+        }
+
+        let mut available_clusters_start_index =
+            self.fs_info.available_clusters_start_index as usize;
+
+        if available_clusters_start_index == 0xFFFFFFFF {
+            for (i, fat_cluster) in self.fat.iter().enumerate() {
+                if *fat_cluster == 0 {
+                    available_clusters_start_index = i;
+                    break;
+                }
+            }
+        }
+
+        self.fat[available_clusters_start_index] = 0xFFFFFFFF;
+        Some(available_clusters_start_index as u32)
+    }
+
+    fn allocate_linked_clusters(&mut self, count: usize) -> Option<Vec<u32>> {
+        self.update_fs_info();
+
+        if self.fs_info.last_known_free_cluster_count == 0xFFFFFFFF
+            || self.fs_info.available_clusters_start_index == 0xFFFFFFFF
+        {
+            return None;
+        }
+
+        if count as u32 > self.fs_info.last_known_free_cluster_count {
+            return None;
+        }
+
+        let mut clusters = vec![0_u32; count];
+        let mut allocated_cluster_index = 0_usize;
+        let mut cluster_index = self.fs_info.available_clusters_start_index as usize;
+        loop {
+            if cluster_index >= self.fat.len() {
+                return None;
+            }
+
+            if self.fat[cluster_index] == 0 {
+                clusters[allocated_cluster_index] = cluster_index as u32;
+
+                allocated_cluster_index += 1;
+                if allocated_cluster_index >= clusters.len() {
+                    break;
+                }
+            }
+            cluster_index += 1;
+        }
+
+        let mut previous_cluster = 0_u32;
+        for cluster_index in clusters.iter() {
+            self.fat[*cluster_index as usize] = 0xFFFFFFFF;
+            if previous_cluster != 0 {
+                self.fat[previous_cluster as usize] = *cluster_index;
+            }
+            previous_cluster = *cluster_index;
+        }
+
+        Some(clusters)
+    }
+
+    fn find_last_cluster_in_link(&mut self, start_cluster: u32) -> u32 {
+        let max_cluster = self.volume_header.large_sectors_per_fat as usize
+            * self.volume_header.bytes_per_sector as usize
+            / std::mem::size_of::<u32>();
+        let mut cluster = start_cluster;
+        println!("Going down cluster chain starting at {:?}", cluster);
+        loop {
+            let next_cluster = self.fat[cluster as usize];
+            if next_cluster == cluster {
+                panic!("Cluster refers to its self.")
+            }
+            if next_cluster > max_cluster as u32 {
+                break;
+            }
+            println!("Cluster {:?}", next_cluster);
+            cluster = next_cluster;
+        }
+        cluster
+    }
+
+    fn count_files_in_directory(&mut self, directory_cluster: u32) -> usize {
+        let max_cluster = self.volume_header.large_sectors_per_fat as usize
+            * self.volume_header.bytes_per_sector as usize
+            / std::mem::size_of::<u32>();
+
+        let cluster_begin_lba = self.volume_header.beginning_sector
+            + self.volume_header.reserved_sectors as u32
+            + (self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat);
+        let size_of_cluster = self.volume_header.sectors_per_cluster as usize
+            * self.volume_header.bytes_per_sector as usize;
+
+        let mut cluster_number = directory_cluster;
+        let mut cluster_data = vec![0_u8; size_of_cluster];
+        let mut directory_entry_count = 0_usize;
+
+        loop {
+            let cluster_lba: u32 = cluster_begin_lba
+                + (cluster_number - 2) * self.volume_header.sectors_per_cluster as u32;
+
+            self.disk.read_sectors_from_disk(
+                cluster_lba,
+                self.volume_header.sectors_per_cluster as u32,
+                self.volume_header.bytes_per_sector as usize,
+                &mut cluster_data,
+            );
+
+            let mut checked_long_file_name_flag = false;
+            for i in 0..(size_of_cluster / mem::size_of::<DirectoryEntry>()) {
+                let attribute: u8 = *cluster_data
+                    .get(i * mem::size_of::<DirectoryEntry>()..)
+                    .and_then(|a| a.get(11..12))
+                    .and_then(|a| a.get(0))
+                    .unwrap();
+                let attribute: DirectoryAttributes = attribute.try_into().unwrap();
+
+                if !checked_long_file_name_flag && attribute.has_long_file_name() {
+                    checked_long_file_name_flag = true;
+                    continue;
+                }
+                checked_long_file_name_flag = false;
+
+                let directory_entry = Self::read_directory_entry_from_buffer(i, &cluster_data);
+
+                // If its a file we check the size of the file in bytes
+                if directory_entry.attributes.is_file() {
+                    let size_of_file = directory_entry.size_of_file;
+                    if directory_entry.size_of_file == 0 {
+                        break;
+                    }
+                }
+                // If its a directory the directory flag will be set and we can just count the entry count
+
+                directory_entry_count += 1;
+            }
+
+            let next_cluster = self.fat[cluster_number as usize];
+            if next_cluster > max_cluster as u32 {
+                break;
+            }
+            cluster_number = next_cluster;
+        }
+
+        directory_entry_count
+    }
+
+    fn add_directory_entry(
+        &mut self,
+        directory_entry: &DirectoryEntry,
+        parent_directory_cluster: u32,
+        directory_count: u32,
+    ) {
+        let size_of_cluster = self.volume_header.bytes_per_sector as usize
+            * self.volume_header.sectors_per_cluster as usize;
+        let mut directory_cluster = self.find_last_cluster_in_link(parent_directory_cluster);
+
+        let directory_cluster_offset =
+            directory_count as usize % (size_of_cluster / mem::size_of::<DirectoryEntry>());
+
+        if directory_cluster_offset == 0 {
+            let new_directory_cluster = self.allocate_blank_cluster();
+
+            match new_directory_cluster {
+                Some(cluster) => {
+                    self.fat[directory_cluster as usize] = cluster;
+                    directory_cluster = cluster;
+                }
+                None => {
+                    // We are fine to panic here we haven't written to disk or touched the fat table
+                    // We have updated the FSInfo though but its fine
+                    panic!("Unable to allocate new blank cluster for directry entry")
+                }
+            };
+        }
+        let directory_cluster = directory_cluster;
+
+        let cluster_begin_lba = self.volume_header.beginning_sector
+            + self.volume_header.reserved_sectors as u32
+            + (self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat);
+        let cluster_lba: u32 = cluster_begin_lba
+            + (directory_cluster - 2) * self.volume_header.sectors_per_cluster as u32;
+
+        let mut cluster_buffer = vec![0_u8; size_of_cluster];
+        self.disk.read_sectors_from_disk(
+            cluster_lba,
+            self.volume_header.sectors_per_cluster as u32,
+            self.volume_header.bytes_per_sector as usize,
+            &mut cluster_buffer,
+        );
+
+        let bytes: &[u8; mem::size_of::<DirectoryEntry>()] =
+            &unsafe { mem::transmute(*directory_entry) };
+
+        println!(
+            "Creating new directory entry at: Cluster {:?} Offset {}",
+            directory_cluster, directory_cluster_offset
+        );
+        let cluster_slice = &mut cluster_buffer
+            [directory_cluster_offset * mem::size_of::<DirectoryEntry>()..]
+            [..mem::size_of::<DirectoryEntry>()];
+        cluster_slice.copy_from_slice(bytes);
+
+        self.disk.write_sectors_to_disk(
+            cluster_begin_lba,
+            self.volume_header.sectors_per_cluster as u32,
+            self.volume_header.bytes_per_sector as usize,
+            &cluster_buffer,
+        );
+    }
+}
+
+impl Fat32Disk {
+    pub fn new(mut disk: Disk) -> Self {
+        let volume_header = Self::read_fat32_volume_header(&mut disk);
+        let fs_info = Self::read_fs_info(&mut disk, &volume_header);
+        let fat = Self::read_fat(&mut disk, &volume_header);
+
+        Fat32Disk {
+            volume_header,
+            fs_info,
+            fat,
+            disk,
+        }
+    }
+
+    pub fn find_file(&mut self, name: &str) -> Option<DirectoryEntry> {
+        let directory_entries_per_sector: usize =
+            self.volume_header.bytes_per_sector as usize / mem::size_of::<DirectoryEntry>();
+
+        // Convert string into space padded 8 byte long asci string
+        let mut asci = Vec::from(name.as_ascii().unwrap());
+        asci.resize(8, ascii::Char::Space);
+        let asci: &[u8] = asci.as_bytes();
+
+        let cluster_begin_lba = self.volume_header.beginning_sector
+            + self.volume_header.reserved_sectors as u32
+            + (self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat);
+        let lba: u32 = cluster_begin_lba
+            + (self.volume_header.root_directory_cluster - 2)
+                * self.volume_header.sectors_per_cluster as u32;
+
+        let directory_entry_count =
+            self.count_files_in_directory(self.volume_header.root_directory_cluster);
+        let number_of_sectors = directory_entries_per_sector / directory_entry_count;
+
+        let mut cluster_buffer =
+            vec![0_u8; number_of_sectors * self.volume_header.bytes_per_sector as usize];
+        self.disk.read_sectors_from_disk(
+            lba,
+            number_of_sectors as u32,
+            self.volume_header.bytes_per_sector as usize,
+            &mut cluster_buffer,
+        );
+
+        let mut directory_entry_index: u16 = 0;
+        loop {
+            if (directory_entry_count as u16) < directory_entry_index {
+                return None;
+            }
+
+            let directory_entry: DirectoryEntry =
+                Self::read_directory_entry_from_buffer(directory_entry_index, &cluster_buffer);
+            if directory_entry.file_name == *asci {
+                return Some(directory_entry);
+            }
+            directory_entry_index += 1;
+        }
+    }
+
+    pub fn write_file(&mut self, file_name: &str, extension: &str, file_buffer: Vec<u8>) {
+        // Convert string into space padded 8 byte long asci string
+        let mut file_name_ascii = Vec::from(file_name.as_ascii().unwrap());
+        file_name_ascii.resize(8, ascii::Char::Space);
+        let file_name_ascii: &[u8] = file_name_ascii.as_bytes();
+
+        // Convert string into space padded 3 byte long asci string
+        let mut extension_ascii = Vec::from(extension.as_ascii().unwrap());
+        extension_ascii.resize(3, ascii::Char::Space);
+        let extension_ascii: &[u8] = extension_ascii.as_bytes();
+
+        let size_of_cluster = self.volume_header.bytes_per_sector as usize
+            * self.volume_header.sectors_per_cluster as usize;
+
+        let mut cluster_count = file_buffer.len() / size_of_cluster;
+        let mut bytes_left = file_buffer.len();
+
+        let number_of_files =
+            self.count_files_in_directory(self.volume_header.root_directory_cluster);
+        println!("{}", number_of_files);
+
+        let directory_cluster_offset =
+            number_of_files % size_of_cluster / mem::size_of::<DirectoryEntry>();
+
+        // We are going to have to allocate a new cluster for a new directory entry.
+        if directory_cluster_offset == 0 {
+            cluster_count += 1;
+        }
+        let cluster_count = cluster_count;
+
+        self.update_fs_info();
+        if (self.fs_info.last_known_free_cluster_count as usize) < cluster_count {
+            panic!("Out of disk space!");
+        }
+
+        // Add Directory Entry
+        let file_data_cluster_indices = self.allocate_linked_clusters(cluster_count);
+        let file_data_cluster_indices = match file_data_cluster_indices {
+            Some(v) => v,
+            None => {
+                panic!("Unable to allocate new blank cluster for file data");
+            }
+        };
+
+        let file_start_cluster = file_data_cluster_indices[0];
+        let directory_entry = DirectoryEntry {
+            file_name: file_name_ascii.try_into().unwrap(),
+            extension: extension_ascii.try_into().unwrap(),
+            attributes: 0x00,
+            reserved: 0x00,
+            creation_time_hundreth_of_second: 0x00,
+            creation_time: 0x0000,
+            creation_date: 0x0000,
+            last_access_date: 0x0000,
+            high_bits_of_cluster_number: (file_start_cluster >> 16) as u16,
+            last_modification_time: 0x0000,
+            last_modification_date: 0x0000,
+            low_bits_of_cluster_number: (file_start_cluster & 0xFF) as u16,
+            size_of_file: file_buffer.len() as u32,
+        };
+
+        let number_of_files =
+            self.count_files_in_directory(self.volume_header.root_directory_cluster);
+        self.add_directory_entry(
+            &directory_entry,
+            self.volume_header.root_directory_cluster,
+            number_of_files as u32,
+        );
+
+        let cluster_begin_lba = self.volume_header.beginning_sector
+            + self.volume_header.reserved_sectors as u32
+            + (self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat);
+
+        for (i, cluster_index) in file_data_cluster_indices.iter().enumerate() {
+            let bytes = usize::min(bytes_left, size_of_cluster);
+            let cluster_lba: u32 = cluster_begin_lba
+                + (cluster_index - 2) * self.volume_header.sectors_per_cluster as u32;
+
+            let file_slice = &file_buffer[size_of_cluster * i..][..bytes];
+
+            self.disk.write_sectors_to_disk(
+                cluster_lba,
+                self.volume_header.sectors_per_cluster as u32,
+                self.volume_header.bytes_per_sector as usize,
+                file_slice,
+            );
+            bytes_left -= bytes;
+        }
+
+        self.write_fat_volume_header();
+        self.write_fat();
+        self.write_fs_info();
+    }
+
+    fn load_file(&mut self, directory_entry: &DirectoryEntry) -> Vec<u8> {
+        let cluster_begin_lba = self.volume_header.beginning_sector
+            + self.volume_header.reserved_sectors as u32
+            + (self.volume_header.fat_count as u32 * self.volume_header.large_sectors_per_fat);
+
+        let cluster_size = self.volume_header.sectors_per_cluster as usize
+            * self.volume_header.bytes_per_sector as usize;
+
+        let directory_cluster_number = directory_entry.low_bits_of_cluster_number as u32
+            | (directory_entry.high_bits_of_cluster_number as u32) << 16;
+        let size =
+            unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(directory_entry.size_of_file)) };
+
+        let mut file_buffer: Vec<u8> = vec![0_u8; size as usize];
+
+        let mut cluster_data = vec![0_u8; cluster_size];
+        if size <= cluster_size as u32 {
+            let cluster_lba: u32 = cluster_begin_lba
+                + (directory_cluster_number - 2) * self.volume_header.sectors_per_cluster as u32;
+            self.disk.read_sectors_from_disk(
+                cluster_lba,
+                self.volume_header.sectors_per_cluster as u32,
+                self.volume_header.bytes_per_sector as usize,
+                &mut cluster_data,
+            );
+
+            file_buffer.copy_from_slice(&cluster_data[0..size as usize]);
+        } else {
+            let mut cluster_index: u32 = 0;
+            let mut current_cluster = directory_cluster_number;
+            let mut bytes_left_to_read = size;
+
+            loop {
+                let cluster_lba: u32 = cluster_begin_lba
+                    + (current_cluster - 2) * self.volume_header.sectors_per_cluster as u32;
+                self.disk.read_sectors_from_disk(
+                    cluster_lba,
+                    self.volume_header.sectors_per_cluster as u32,
+                    self.volume_header.bytes_per_sector as usize,
+                    &mut cluster_data,
+                );
+
+                let bytes_to_read = usize::min(bytes_left_to_read as usize, cluster_size);
+                file_buffer[(cluster_index as usize * cluster_size)..][..bytes_to_read]
+                    .copy_from_slice(
+                        &cluster_data[0..usize::min(bytes_left_to_read as usize, cluster_size)],
+                    );
+                bytes_left_to_read -= bytes_to_read as u32;
+
+                let next_cluster = self.fat[current_cluster as usize];
+                if next_cluster == 0xFFFFFFFF || bytes_left_to_read == 0 {
+                    break;
+                }
+
+                current_cluster = next_cluster;
+                cluster_index += 1;
+            }
+        }
+
+        file_buffer
+    }
+}
