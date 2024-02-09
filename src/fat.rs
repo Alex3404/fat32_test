@@ -1,9 +1,10 @@
 use crate::disk::Disk;
-use crate::filesystem::{self, FileSystem, FileSystemError};
+use crate::filesystem::{self, FileSystemError};
 use core::mem;
 use std::ascii;
 use std::borrow::Borrow;
-use std::fmt::Error;
+use std::marker::PhantomData;
+use std::ops::Add;
 use std::slice::ChunksExact;
 extern crate static_assertions as sa;
 
@@ -18,6 +19,48 @@ fn str_to_padded_ascii_string<const LENGTH: usize>(
 
     let ascii: &[u8] = ascii.as_bytes();
     ascii.try_into().unwrap_or([0_u8; LENGTH])
+}
+
+fn append_ascii_to_string<const LENGTH: usize>(
+    string: &mut String,
+    ascii: &[u8; LENGTH],
+    pad_char: ascii::Char,
+) {
+    let pad_byte = pad_char.to_u8();
+
+    // Find the last index in a string where all the chars infront is the pad char
+    let last_padded_inverse_index = ascii
+        .iter()
+        .rev()
+        .enumerate()
+        .scan(None, |state, (index, &current)| {
+            let prev_char: u8 = match *state {
+                Some(val) => val,
+                None => {
+                    *state = Some(current);
+                    return Some(index);
+                }
+            };
+
+            if prev_char == pad_byte && current != pad_byte {
+                None
+            } else {
+                Some(index)
+            }
+        })
+        .last();
+
+    let last_pad = match last_padded_inverse_index {
+        Some(last_padded_inverse_index) => ascii.len() - (last_padded_inverse_index + 1),
+        None => LENGTH,
+    };
+
+    let ascii = &ascii[..last_pad];
+
+    let str = String::from_utf8(Vec::from(ascii));
+    if let Ok(str) = str {
+        string.push_str(&str)
+    }
 }
 
 #[repr(C, packed)]
@@ -219,19 +262,71 @@ pub struct Fat32FileSystem {
     fat: Vec<u32>,
     disk: Disk,
 }
+trait Cluster<T: Into<usize> = Self>: Into<usize> + From<usize> {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Cluster(usize);
+struct DirectoryCluster(usize);
 
-struct Clusters<'a> {
+impl Cluster for DirectoryCluster {}
+
+impl From<usize> for DirectoryCluster {
+    fn from(value: usize) -> Self {
+        // This assumes that the cluster being passed in is valid
+        Self(value)
+    }
+}
+
+impl Into<usize> for DirectoryCluster {
+    fn into(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DataCluster(usize);
+
+impl Cluster for DataCluster {}
+
+impl From<usize> for DataCluster {
+    fn from(value: usize) -> Self {
+        // This assumes that the cluster being passed in is valid
+        Self(value)
+    }
+}
+
+impl Into<usize> for DataCluster {
+    fn into(self) -> usize {
+        self.0
+    }
+}
+
+struct ClustersIter<'a, T> {
     start_cluster: usize,
     current_cluster: usize,
     file_system: &'a Fat32FileSystem,
+    _phantom: PhantomData<T>,
 }
 
-impl<'a> Iterator for Clusters<'a> {
-    type Item = Cluster;
+impl<'a, T> ClustersIter<'a, T>
+where
+    T: Into<usize>,
+{
+    fn new(file_system: &'a Fat32FileSystem, cluster: T) -> Self {
+        let cluster: usize = T::into(cluster);
+        Self {
+            start_cluster: cluster,
+            current_cluster: cluster,
+            file_system,
+            _phantom: PhantomData,
+        }
+    }
+}
 
+impl<'a, T> Iterator for ClustersIter<'a, T>
+where
+    T: From<usize>,
+{
+    type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
         let next_cluster = self.file_system.fat[self.current_cluster] as usize;
 
@@ -239,38 +334,63 @@ impl<'a> Iterator for Clusters<'a> {
             && next_cluster <= self.file_system.max_cluster()
         {
             self.current_cluster = next_cluster;
-
-            Some(Cluster(next_cluster))
+            Some(T::from(next_cluster))
         } else {
             None
         }
     }
 }
 
-impl Fat32Entires<'_> {
-    fn entries_per_cluster(&self) -> usize {
-        return self.file_system.size_of_cluster() / Fat32FileSystem::size_of_directory_entry();
+pub struct Fat32FileEntry {
+    directory_entry: Option<DirectoryEntry>,
+    long_file_name_entry: Option<LongFileNameEntry>,
+}
+
+impl Fat32FileEntry {
+    fn get_file_name(&self) -> Option<String> {
+        let mut file_name = String::new();
+        match self.directory_entry {
+            Some(entry) => {
+                append_ascii_to_string(&mut file_name, &entry.file_name, ascii::Char::Space);
+
+                // TODO: Construct long file name string here
+
+                Some(file_name)
+            }
+            None => return None,
+        }
     }
 }
 
-pub struct Fat32FileEntry {
-    directory_entry: Option<DirectoryEntry>,
-    optional_lfn: Option<LongFileNameEntry>,
-}
-
-pub struct Fat32Entires<'a> {
+pub struct Fat32Entires<'a, 'b> {
     file_system: &'a Fat32FileSystem,
-    current_cluster: Option<Cluster>,
+    current_cluster: Option<DirectoryCluster>,
     cluster_data: Vec<u8>,
-    chunked_iter: ChunksExact<'a, u8>,
-    clusters: Clusters<'a>,
+    chunked_iter: ChunksExact<'b, u8>,
+    cluster_iter: ClustersIter<'a, DirectoryCluster>,
 }
 
-impl Fat32Entires<'_> {
+impl Fat32Entires<'_, '_> {
+    fn new<'a, 'b>(file_system: &'a Fat32FileSystem, directory_cluster: DirectoryCluster) -> Self {
+        let cluster_data = vec![0_u8; file_system.size_of_cluster()];
+
+        Self {
+            file_system,
+            current_cluster: None,
+            cluster_data,
+            chunked_iter: cluster_data.chunks_exact(Fat32FileSystem::size_of_directory_entry()),
+            cluster_iter: ClustersIter::new(file_system, directory_cluster),
+        }
+    }
+
+    fn entries_per_cluster(&self) -> usize {
+        return self.file_system.size_of_cluster() / Fat32FileSystem::size_of_directory_entry();
+    }
+
     fn read_entry<const SIZE_OF_ENTRY: usize>(&mut self) -> Option<&[u8; SIZE_OF_ENTRY]> {
         let mut next_chunk = self.chunked_iter.next();
         if next_chunk.is_none() {
-            let next_cluster = self.clusters.next();
+            let next_cluster = self.cluster_iter.next();
             let next_cluster = match next_cluster {
                 None => return None,
                 Some(cluster) => cluster.0,
@@ -296,7 +416,6 @@ impl Fat32Entires<'_> {
     }
 
     fn parse_attributes_from_chunk<const SIZE_OF_ENTRY: usize>(
-        &mut self,
         entry_chunk: &[u8; SIZE_OF_ENTRY],
     ) -> Option<DirectoryAttributes> {
         let attribute_byte = entry_chunk.get(11..).and_then(|a| a.first());
@@ -314,7 +433,7 @@ impl Fat32Entires<'_> {
     }
 }
 
-impl<'a> Iterator for Fat32Entires<'a> {
+impl<'a, 'b> Iterator for Fat32Entires<'a, 'b> {
     type Item = Fat32FileEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -325,7 +444,7 @@ impl<'a> Iterator for Fat32Entires<'a> {
             None => return None,
         };
 
-        let attribute: Option<DirectoryAttributes> = self.parse_attributes_from_chunk(entry_chunk);
+        let attribute: Option<DirectoryAttributes> = Self::parse_attributes_from_chunk(entry_chunk);
         let attribute = match attribute {
             Some(attribute) => attribute,
             None => return None,
@@ -333,6 +452,7 @@ impl<'a> Iterator for Fat32Entires<'a> {
 
         let mut directory_entry: DirectoryEntry;
         let long_file_name: Option<LongFileNameEntry>;
+
         if attribute.has_long_file_name() {
             long_file_name = Some(unsafe { core::mem::transmute(*entry_chunk) });
 
@@ -344,17 +464,51 @@ impl<'a> Iterator for Fat32Entires<'a> {
 
             directory_entry = unsafe { core::mem::transmute(*second_entry_chunk) };
         } else {
+            long_file_name = None;
             directory_entry = unsafe { core::mem::transmute(*entry_chunk) };
         }
 
         Some(Fat32FileEntry {
             directory_entry: Some(directory_entry),
-            optional_lfn: long_file_name,
+            long_file_name_entry: long_file_name,
         })
     }
 }
 
 pub struct Fat32File(Fat32FileEntry);
+
+impl Fat32File {
+    fn get_file_name(&self) -> Option<String> {
+        self.0.get_file_name()
+    }
+
+    fn get_full_file_name(&self) -> Option<String> {
+        let directory_entry = self.0.directory_entry;
+        let directory_entry = match directory_entry {
+            Some(directory_entry) => directory_entry,
+            None => return None,
+        };
+
+        let file_name = self.get_file_name();
+        let mut file_name = match file_name {
+            Some(file_name) => file_name,
+            None => return None,
+        };
+
+        let extension_empty = directory_entry.extension[0] != ascii::Char::Space.to_u8();
+        if !extension_empty {
+            file_name.push('.');
+
+            append_ascii_to_string(
+                &mut file_name,
+                &directory_entry.extension,
+                ascii::Char::Space,
+            );
+        }
+
+        Some(file_name)
+    }
+}
 
 impl TryFrom<Fat32FileEntry> for Fat32File {
     type Error = ();
@@ -373,6 +527,30 @@ impl TryFrom<Fat32FileEntry> for Fat32File {
 }
 
 pub struct Fat32Directory(Fat32FileEntry);
+
+impl Fat32Directory {
+    fn get_file_name(&self) -> Option<String> {
+        self.0.get_file_name()
+    }
+
+    fn root_directory() -> Self {
+        return Self(Fat32FileEntry {
+            long_file_name_entry: None,
+            directory_entry: None,
+        });
+    }
+
+    fn get_directory_cluster(&self, file_system: &Fat32FileSystem) -> DirectoryCluster {
+        match self.0.directory_entry {
+            Some(entry) => {
+                let cluster = (entry.low_bits_of_cluster_number as usize)
+                    | (entry.high_bits_of_cluster_number as usize) << 16;
+                cluster.into()
+            }
+            None => (file_system.volume_header.root_directory_cluster as usize).into(),
+        }
+    }
+}
 
 impl TryFrom<Fat32FileEntry> for Fat32Directory {
     type Error = ();
@@ -418,27 +596,32 @@ impl Fat32FileSystem {
         core::mem::size_of::<DirectoryEntry>()
     }
 
-    fn get_cluster<'a>(&'a self, start_cluster: usize) -> Option<Cluster> {
+    fn get_cluster<'a, T>(&'a self, start_cluster: usize) -> Option<T>
+    where
+        T: Cluster,
+    {
         if start_cluster >= self.min_cluster() && start_cluster <= self.max_cluster() {
-            Some(Cluster(start_cluster))
+            Some(T::from(start_cluster))
         } else {
             None
         }
     }
 
-    fn get_clusters<'a>(&'a self, start_cluster: Cluster) -> Option<Clusters<'a>> {
-        Some(Clusters {
-            start_cluster: start_cluster.0,
-            current_cluster: start_cluster.0,
-            file_system: self,
-        })
+    fn get_clusters<'a, T>(&'a self, start_cluster: T) -> Option<ClustersIter<'a, T>>
+    where
+        T: Cluster,
+    {
+        Some(ClustersIter::new(self, start_cluster))
     }
 
-    fn find_last_cluster(&mut self, start_cluster: Cluster) -> Option<usize> {
+    fn find_last_cluster<T>(&mut self, start_cluster: T) -> Option<usize>
+    where
+        T: Cluster,
+    {
         let cluster = self.get_clusters(start_cluster).unwrap().last();
 
         match cluster {
-            Some(cluster) => Some(cluster.0),
+            Some(cluster) => Some(cluster.into()),
             None => None,
         }
     }
@@ -681,11 +864,7 @@ impl Fat32FileSystem {
     fn get_directory_from_path(&mut self, path: &str) -> Result<Fat32Directory, FileSystemError> {
         let path_directories: Vec<&str> = match path.trim().len() {
             0 => {
-                return Ok(Fat32Directory {
-                    is_root_directory: true,
-                    directory_entry: None,
-                    optional_lfn: None,
-                })
+                return Ok(Fat32Directory::root_directory());
             }
             _ => path.split('\\').collect(),
         };
@@ -696,91 +875,39 @@ impl Fat32FileSystem {
             }
         }
 
-        let mut current_cluster = self.volume_header.root_directory_cluster as usize;
         let mut search_path_index = 0_usize;
-        let mut cluster_buffer = vec![0_u8; self.size_of_cluster()];
+        let mut search_directory = Fat32Directory::root_directory();
+        let mut file_entries =
+            Fat32Entires::new(self, search_directory.get_directory_cluster(self));
 
-        loop {
-            let mut skip_to_next_cluster = true;
-            let mut no_more_files = false;
+        while search_path_index < path_directories.len() {
+            let file_entry = file_entries.next();
+            match file_entry {
+                Some(file) => {
+                    let file_name = file.get_file_name();
+                    let file_name = match file_name {
+                        Some(file_name) => file_name,
+                        None => continue,
+                    };
 
-            self.read_cluster(current_cluster, &mut cluster_buffer);
-
-            let mut long_file_name: Option<LongFileNameEntry> = None;
-            for chunk in cluster_buffer.chunks_exact(Self::size_of_directory_entry()) {
-                let sized_chunk: Result<&[u8; Self::size_of_directory_entry()], _> =
-                    chunk.try_into();
-
-                let chunk = match sized_chunk {
-                    Ok(sized_chunk) => sized_chunk,
-                    Err(_) => return Err(FileSystemError(String::from("Error"))),
-                };
-
-                let all_zeros = chunk.iter().all(|&x| x == 0);
-                if all_zeros {
-                    no_more_files = true;
-                    break;
-                }
-
-                let attribute = chunk.get(11..).and_then(|a| a.first());
-                let attribute = match attribute {
-                    Some(attribute) => *attribute,
-                    None => return Err(FileSystemError(String::from("Error"))),
-                };
-
-                let attribute: Result<DirectoryAttributes, _> = attribute.try_into();
-                let attribute = match attribute {
-                    Ok(attribute) => attribute,
-                    Err(_) => return Err(FileSystemError(String::from("Error"))),
-                };
-
-                if attribute.has_long_file_name() && long_file_name.is_none() {
-                    long_file_name = Some(unsafe { std::mem::transmute(*chunk) });
-                    continue;
-                }
-
-                let directory_entry: DirectoryEntry = unsafe { std::mem::transmute(*chunk) };
-
-                if attribute.is_directory() && search_path_index < path_directories.len() {
-                    let directory_name = path_directories[search_path_index];
-                    let directory_name =
-                        str_to_padded_ascii_string(directory_name, ascii::Char::Space);
-
-                    let directory_cluster = directory_entry.get_data_cluster();
-                    if search_path_index == path_directories.len() - 1 {
-                        return Ok(Fat32Directory {
-                            is_root_directory: false,
-                            directory_entry: Some(directory_entry),
-                            optional_lfn: long_file_name,
-                        });
-                    }
-
-                    if directory_entry.file_name == directory_name {
-                        current_cluster = directory_cluster;
-                        search_path_index += 1;
-                        skip_to_next_cluster = false;
-                        break;
+                    let directory: Result<Fat32Directory, _> = file.try_into();
+                    if let Ok(directory) = directory {
+                        let names_equal = file_name.to_lowercase()
+                            == path_directories[search_path_index].to_lowercase();
+                        if names_equal {
+                            file_entries =
+                                Fat32Entires::new(self, directory.get_directory_cluster(self));
+                            search_directory = directory;
+                            search_path_index += 1;
+                        }
                     }
                 }
-
-                if long_file_name.is_some() {
-                    long_file_name = None;
-                }
+                None => break,
             }
+        }
 
-            if no_more_files {
-                break;
-            }
-
-            if skip_to_next_cluster {
-                let next_cluster = self.fat[current_cluster] as usize;
-
-                if next_cluster < 0xFFFF {
-                    current_cluster = next_cluster;
-                } else {
-                    break;
-                }
-            }
+        if search_path_index == path_directories.len() {
+            return Ok(search_directory);
         }
 
         Err(FileSystemError(String::from("Couldn't find directory!")))
@@ -837,79 +964,24 @@ impl filesystem::FileSystem<Fat32File, Fat32Directory> for Fat32FileSystem {
             }
         };
 
-        let mut current_cluster = directory.get_data_cluster(&self.volume_header);
+        let directory_cluster = directory.get_directory_cluster(self);
+        let file_entries = Fat32Entires::new(self, directory_cluster);
 
-        let mut cluster_buffer = vec![0_u8; self.size_of_cluster()];
+        for file_entry in file_entries {
+            let file_entry: Result<Fat32File, _> = file_entry.try_into();
+            let file_entry = match file_entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
 
-        loop {
-            let mut no_more_files = false;
+            let search_full_file_name = match file_entry.get_full_file_name() {
+                Some(str) => str,
+                None => continue,
+            };
 
-            self.read_cluster(current_cluster, &mut cluster_buffer);
-
-            let mut long_file_name: Option<LongFileNameEntry> = None;
-            for chunk in cluster_buffer.chunks_exact(Self::size_of_directory_entry()) {
-                // Hint to the compiler that we know the size of the array so we can transmute
-                let sized_chunk: Result<&[u8; Self::size_of_directory_entry()], _> =
-                    chunk.try_into();
-
-                let chunk = match sized_chunk {
-                    Ok(sized_chunk) => sized_chunk,
-                    Err(_) => return Err(FileSystemError(String::from("Error"))),
-                };
-
-                let all_zeros = chunk.iter().all(|&x| x == 0);
-                if all_zeros {
-                    no_more_files = true;
-                    break;
-                }
-
-                let attribute = chunk.get(11..).and_then(|a| a.first());
-                let attribute = match attribute {
-                    Some(attribute) => *attribute,
-                    None => return Err(FileSystemError(String::from("Error"))),
-                };
-
-                let attribute: Result<DirectoryAttributes, _> = attribute.try_into();
-                let attribute = match attribute {
-                    Ok(attribute) => attribute,
-                    Err(_) => return Err(FileSystemError(String::from("Error"))),
-                };
-
-                if attribute.has_long_file_name() && long_file_name.is_none() {
-                    long_file_name = Some(unsafe { std::mem::transmute(*chunk) });
-                    continue;
-                }
-
-                let directory_entry: DirectoryEntry = unsafe { std::mem::transmute(*chunk) };
-                if attribute.is_file() {
-                    let file_name = str_to_padded_ascii_string(file_name, ascii::Char::Space);
-                    let extension = str_to_padded_ascii_string(extension, ascii::Char::Space);
-
-                    if directory_entry.file_name == file_name
-                        && directory_entry.extension == extension
-                    {
-                        return Ok(Fat32File {
-                            directory_entry,
-                            optional_lfn: long_file_name,
-                        });
-                    }
-                }
-
-                if long_file_name.is_some() {
-                    long_file_name = None;
-                }
-            }
-
-            if no_more_files {
-                break;
-            }
-
-            let next_cluster = self.fat[current_cluster] as usize;
-
-            if next_cluster < 0xFFFF {
-                current_cluster = next_cluster;
-            } else {
-                break;
+            let names_equal = search_full_file_name.to_lowercase() == full_file_name.to_lowercase();
+            if names_equal {
+                return Ok(file_entry);
             }
         }
 
@@ -922,109 +994,110 @@ impl filesystem::FileSystem<Fat32File, Fat32Directory> for Fat32FileSystem {
         path: &str,
         file_attributes: filesystem::FileAttributes,
     ) -> Result<Fat32File, filesystem::FileSystemError> {
-        let directory = self.get_directory_from_path(path);
-        let directory = match directory {
-            Ok(a) => a,
-            Err(err) => {
-                return Err(err);
-            }
-        };
+        // let directory = self.get_directory_from_path(path);
+        // let directory = match directory {
+        //     Ok(a) => a,
+        //     Err(err) => {
+        //         return Err(err);
+        //     }
+        // };
 
-        let (file_name, extension) = Self::parse_file_name(full_file_name);
+        // let (file_name, extension) = Self::parse_file_name(full_file_name);
 
-        let mut cluster = directory.get_data_cluster(&self.volume_header);
-        let mut cluster_buffer = vec![0_u8; self.size_of_cluster()];
+        // let mut cluster = directory.get_data_cluster(&self.volume_header);
+        // let mut cluster_buffer = vec![0_u8; self.size_of_cluster()];
 
-        self.read_cluster(cluster, &mut cluster_buffer);
+        // self.read_cluster(cluster, &mut cluster_buffer);
 
-        let mut chunk_iter = cluster_buffer
-            .chunks_exact_mut(Self::size_of_directory_entry())
-            .enumerate();
+        // let mut chunk_iter = cluster_buffer
+        //     .chunks_exact_mut(Self::size_of_directory_entry())
+        //     .enumerate();
 
-        // TODO: Fix this "cursed" chunked iteration alloc loop thingy
-        let mut clusters_allocated = 0_usize;
-        let fat_file: Option<Fat32File>;
+        // // TODO: Fix this "cursed" chunked iteration alloc loop thingy
+        // let mut clusters_allocated = 0_usize;
+        // let fat_file: Option<Fat32File>;
 
-        loop {
-            let chunk = chunk_iter.next();
+        // loop {
+        //     let chunk = chunk_iter.next();
 
-            let (i, chunk) = match chunk {
-                Some(chunk) => chunk,
-                None => {
-                    if clusters_allocated > 0 {
-                        // Some thing is going really wrong. Allocating way too many clusters for a directory entry.
-                        panic!("Allocating too many clusters!");
-                    }
+        //     let (i, chunk) = match chunk {
+        //         Some(chunk) => chunk,
+        //         None => {
+        //             if clusters_allocated > 0 {
+        //                 // Some thing is going really wrong. Allocating way too many clusters for a directory entry.
+        //                 panic!("Allocating too many clusters!");
+        //             }
 
-                    // We need to allocate another cluster to put the next directory entry
-                    let prev_cluster = cluster;
+        //             // We need to allocate another cluster to put the next directory entry
+        //             let prev_cluster = cluster;
 
-                    let clusters = self.get_avaliable_clusters::<1>();
-                    cluster = match clusters {
-                        Some(file) => file[0] as usize,
-                        None => return Err(FileSystemError(String::from("Disk is full!"))),
-                    };
-                    println!("Next cluster: {}", cluster);
+        //             let clusters = self.get_avaliable_clusters::<1>();
+        //             cluster = match clusters {
+        //                 Some(file) => file[0] as usize,
+        //                 None => return Err(FileSystemError(String::from("Disk is full!"))),
+        //             };
+        //             println!("Next cluster: {}", cluster);
 
-                    self.link_clusters([prev_cluster as u32, cluster as u32]);
-                    self.read_cluster(cluster, &mut cluster_buffer);
+        //             self.link_clusters([prev_cluster as u32, cluster as u32]);
+        //             self.read_cluster(cluster, &mut cluster_buffer);
 
-                    chunk_iter = cluster_buffer
-                        .chunks_exact_mut(Self::size_of_directory_entry())
-                        .enumerate();
-                    clusters_allocated += 1;
-                    continue;
-                }
-            };
+        //             chunk_iter = cluster_buffer
+        //                 .chunks_exact_mut(Self::size_of_directory_entry())
+        //                 .enumerate();
+        //             clusters_allocated += 1;
+        //             continue;
+        //         }
+        //     };
 
-            // Hint to the compiler that we know the size of the array so we can transmute
-            let sized_chunk: Result<&mut [u8; Self::size_of_directory_entry()], _> =
-                chunk.try_into();
+        //     // Hint to the compiler that we know the size of the array so we can transmute
+        //     let sized_chunk: Result<&mut [u8; Self::size_of_directory_entry()], _> =
+        //         chunk.try_into();
 
-            let chunk = match sized_chunk {
-                Ok(sized_chunk) => sized_chunk,
-                Err(_) => return Err(FileSystemError(String::from("Error"))),
-            };
+        //     let chunk = match sized_chunk {
+        //         Ok(sized_chunk) => sized_chunk,
+        //         Err(_) => return Err(FileSystemError(String::from("Error"))),
+        //     };
 
-            let all_zeros = chunk.iter().all(|&x| x == 0);
-            if all_zeros {
-                println!("Creating file at {}", i);
+        //     let all_zeros = chunk.iter().all(|&x| x == 0);
+        //     if all_zeros {
+        //         println!("Creating file at {}", i);
 
-                let mut attributes = DirectoryAttributes(DirectoryAttributes::FILE);
-                if file_attributes.is_read_only() {
-                    println!("Read Only!");
-                    attributes.0 |= DirectoryAttributes::READ_ONLY;
-                }
-                if file_attributes.is_hidden() {
-                    println!("Hidden!");
-                    attributes.0 |= DirectoryAttributes::HIDDEN;
-                }
+        //         let mut attributes = DirectoryAttributes(DirectoryAttributes::FILE);
+        //         if file_attributes.is_read_only() {
+        //             println!("Read Only!");
+        //             attributes.0 |= DirectoryAttributes::READ_ONLY;
+        //         }
+        //         if file_attributes.is_hidden() {
+        //             println!("Hidden!");
+        //             attributes.0 |= DirectoryAttributes::HIDDEN;
+        //         }
 
-                let directory_entry =
-                    DirectoryEntry::new(file_name, extension, 0xFFFFFFFF, 0x0, attributes);
+        //         let directory_entry =
+        //             DirectoryEntry::new(file_name, extension, 0xFFFFFFFF, 0x0, attributes);
 
-                fat_file = Some(Fat32File {
-                    directory_entry,
-                    optional_lfn: None,
-                });
+        //         fat_file = Some(Fat32File {
+        //             directory_entry,
+        //             optional_lfn: None,
+        //         });
 
-                let directory_entry: [u8; Self::size_of_directory_entry()] =
-                    unsafe { core::mem::transmute(directory_entry) };
-                println!("{:?}", directory_entry);
+        //         let directory_entry: [u8; Self::size_of_directory_entry()] =
+        //             unsafe { core::mem::transmute(directory_entry) };
+        //         println!("{:?}", directory_entry);
 
-                chunk.copy_from_slice(&directory_entry);
-                break;
-            } else {
-            }
-        }
+        //         chunk.copy_from_slice(&directory_entry);
+        //         break;
+        //     } else {
+        //     }
+        // }
 
-        match fat_file {
-            Some(file) => {
-                self.write_cluster(cluster, &cluster_buffer);
-                Ok(file)
-            }
-            None => Err(FileSystemError(String::from("Unable to create file!"))),
-        }
+        // match fat_file {
+        //     Some(file) => {
+        //         self.write_cluster(cluster, &cluster_buffer);
+        //         Ok(file)
+        //     }
+        //     None => Err(FileSystemError(String::from("Unable to create file!"))),
+        // }
+        Err(FileSystemError(String::from("No Impl!")))
     }
 
     fn create_directory(
